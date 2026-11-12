@@ -83,6 +83,61 @@ lead-in actually got trimmed, not just that a file got produced. See
 [`examples/README.md`](examples/README.md) for more on what each sample
 file is for.
 
+### Title and date card
+
+Click **Process** to enter a title and date for each video that has not already
+been processed. The date is displayed exactly as typed (for example,
+`November 12, 2026`). Cancel closes the prompts without starting the batch.
+
+The output order is **frontmatter → title and date → main video**. The title
+card lasts six seconds on black, with centered white title text and a smaller
+light-gray date. Text fades in and grows from zero over three seconds, easing
+to a stop inside safe frame margins. It stays at full size while fading out
+over the next three seconds. A spaced dash in the title creates a line break
+and is removed (for example, `Sean Sullivan - This is My Presentation` becomes
+two lines). Uncheck **Grow text
+from zero to fit the frame** for a static card. Long titles wrap to fit.
+The lettering is redrawn from scalable font outlines at each animated size.
+The card is silent, and the main video's audio starts with its picture.
+
+The command line also prompts per video. For unattended processing, pass both
+`--title "An Evening of Photography" --date "November 12, 2026"`; these values
+apply to every video in that run. Use `--no-title-animation` for a static card,
+or `--no-title-card` to retain the opening-only workflow without prompts.
+Existing output files are still skipped; remove an old output first if you
+want to regenerate it with a title card.
+
+### Live progress
+
+While processing, the window shows the current stage, that stage's percentage,
+and elapsed time for the current file. A separate bar counts completed files
+in the batch. Percentages restart for each stage: encoding, verification,
+audio processing, joining clips, and saving the final output.
+
+The percentage comes from actual processed video/audio timestamps. Operations
+without a known duration show a moving activity bar instead. If no new progress
+arrives for 15 seconds, the status reports how long it has been since the last
+advance; this can also happen while an encoder is finalizing a large file.
+An actual processing error is shown in the log and restores the Process button.
+
+### Optional closing video
+
+In Settings, choose an MP4 next to **Add closing video**. Selecting a file
+turns the option on; uncheck it to disable the closing while keeping the
+selected path for next time. The selection is remembered.
+
+The main video fades in over three seconds after the title, including sound.
+With a closing enabled, its final three seconds fade out to black and silence,
+then the closing clip starts at its own normal picture and sound levels.
+These fades use the main video's existing footage; they do not add time.
+For a main clip shorter than six seconds, the two fades share its duration
+equally. Without a closing clip, only the main fade-in is applied.
+
+The CLI accepts `--closing "closing.mp4"` or `--no-closing` to override the
+saved setting. Keep the opening and closing clips out of the main-video queue.
+To test a video processed with an earlier version, remove its previous output
+or select a different output folder first, because existing results are skipped.
+
 ### Command line (Windows only)
 
 **No Python install needed.** Grab `add-frontmatter.exe` from
@@ -243,25 +298,19 @@ see "Desktop app" above.
    if neither is found, the video is used as-is — this is purely additive
    and never blocks processing. See "Auto-trim details" below for exactly
    what's expected and how it decides.
-4. **The main video's picture is never re-encoded** — it's byte-copied,
-   unchanged, throughout. The tool probes the main video's exact resolution,
-   frame rate, and pixel format, then re-encodes a temporary copy of the
-   frontmatter's video to match precisely. The two video tracks are then
-   joined with a plain stream copy.
-5. Audio is built separately from video on purpose. Feeding a freshly
-   re-encoded frontmatter *audio* segment into a plain stream-copy concat
-   alongside video looks fine but isn't: AAC always pads to whole encoder
-   frames, so a fresh segment's encoded length can't be trimmed to match the
-   video to the millisecond — the result is a small but audible sync drift
-   at the seam. Instead, one continuous audio track (frontmatter's audio, or
-   silence if it has none, followed by the main clip's own original audio)
-   is built with sample-accurate filtering referenced against the video's
-   *measured* exact duration, then muxed against the untouched video. This
-   is the one part of the main video file that does get re-encoded — its
-   audio, not its picture — because that's what's needed to guarantee sync.
-6. If the main video has no audio track at all, the output has none either.
-   If the main video has audio but the frontmatter doesn't, silence matching
-   the main video's audio format fills the frontmatter's portion.
+4. **Conform video and apply main-video fades.** The opening, title and optional
+   closing match the main video's dimensions, frame rate and pixel format.
+   The main video fades in from black over three seconds after the title.
+   When a closing clip is selected, the main video fades to black over its
+   final three seconds before the closing starts. Fades require re-encoding
+   the main picture, so processing can take longer than earlier versions.
+5. **Build synchronized audio.** Opening, main and closing audio are aligned
+   to each segment's measured picture duration. The title is silent. Main
+   audio fades in and out with its picture; closing audio retains its own
+   volume. Segments without audio receive silence, so a silent main video
+   can still be followed by a closing clip with sound.
+6. **Join the sequence.** Opening → title/date → main → optional closing.
+   Short main clips use proportionally shorter fades to prevent overlap.
 7. **Saves each result tagged with what was done to it:** `_FMAdded` always,
    plus `_StartOffsetMMSS` (the exact offset that was trimmed, in
    minutes/seconds) whenever a trim was actually applied — so

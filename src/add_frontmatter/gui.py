@@ -17,14 +17,16 @@ import queue
 import sys
 import tempfile
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from . import __version__
 from .config import load_config, save_config
 from .core import FfmpegNotFoundError, already_processed, get_ffmpeg_path, process_video
 from .trim import DEFAULT_TRIGGERS, maybe_trim, strip_offset_token
+from .title_card import TitleCard
 
 ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 
@@ -35,7 +37,9 @@ APP_DESCRIPTION = (
     "of a Zoom-recorded meeting video (both MP4). If a Zoom chat log with the same "
     f"base name is found next to a video, it looks for a chat line containing {_trigger_desc} "
     "(case-insensitive) and trims the start of the video to that point before prepending the "
-    "frontmatter. Processes as many files as you add, in one batch."
+    "frontmatter. Prompts for each video’s title and date, then inserts an animated title card "
+    "between the opening and the main video. Optionally append a closing video, "
+    "with three-second picture and sound fades on the main video."
 )
 
 
@@ -50,20 +54,64 @@ def _resource_path(name: str) -> Path:
     return ASSETS_DIR / name
 
 
+class TitleCardDialog(simpledialog.Dialog):
+    """Collect each video's title before starting the background worker."""
+    def __init__(self, parent, video: Path):
+        self.video = video
+        super().__init__(parent, title="Video title and date")
+
+    def body(self, master):
+        ttk.Label(master, text=self.video.name, wraplength=440).grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        ttk.Label(master, text="Video title:").grid(row=1, column=0, sticky="w")
+        self.title_entry = ttk.Entry(master, width=44)
+        self.title_entry.grid(row=1, column=1, padx=6, pady=4)
+        ttk.Label(master, text="Date:").grid(row=2, column=0, sticky="w")
+        self.date_entry = ttk.Entry(master, width=44)
+        self.date_entry.grid(row=2, column=1, padx=6, pady=4)
+        ttk.Label(master, text="Example: November 12, 2026").grid(row=3, column=1, sticky="w")
+        self.animate = tk.BooleanVar(master, value=True)
+        ttk.Checkbutton(master, text="Grow text from zero to fit the frame", variable=self.animate).grid(
+            row=4, column=0, columnspan=2, sticky="w", pady=8)
+        ttk.Label(master, text="3-second fade in and zoom, then 3-second fade out.").grid(
+            row=5, column=0, columnspan=2, sticky="w")
+        return self.title_entry
+
+    def validate(self):
+        try:
+            self.card = TitleCard(self.title_entry.get().strip(), self.date_entry.get().strip(),
+                                  animate=self.animate.get())
+        except ValueError as exc:
+            messagebox.showerror("Check title and date", str(exc), parent=self)
+            return False
+        return True
+
+    def apply(self):
+        self.result = self.card
+
+
 class FrontmatterGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title(f"Add Frontmatter — v{__version__}")
-        self.root.geometry("640x580")
-        self.root.minsize(520, 460)
+        self.root.geometry("800x880")
+        self.root.minsize(760, 820)
 
         self.cfg = load_config()
         self.frontmatter_path = tk.StringVar(value=self.cfg.get("frontmatter", ""))
         self.output_dir_path = tk.StringVar(value=self.cfg.get("output_dir", "") or "")
+        self.closing_path = tk.StringVar(value=self.cfg.get("closing", ""))
+        self.use_closing = tk.BooleanVar(value=self.cfg.get("use_closing", False))
         self.auto_trim = tk.BooleanVar(value=self.cfg.get("auto_trim", True))
         self.queued_files: list[Path] = []
-        self.result_queue: "queue.Queue[tuple[str, str, bool]]" = queue.Queue()
+        self.result_queue: "queue.Queue[tuple[str, object, bool]]" = queue.Queue()
         self.worker_running = False
+        self.stage_name = "Idle"
+        self.stage_fraction = None
+        self.file_started = None
+        self.last_advance = None
+        self.failed_files = 0
+        self.worker_error = False
 
         self._build_widgets()
         self._poll_result_queue()
@@ -101,7 +149,6 @@ class FrontmatterGUI:
             text=APP_DESCRIPTION,
             wraplength=560,
             justify="left",
-            foreground="#444444",
         ).pack(anchor="w", pady=(6, 0))
 
         settings_frame = ttk.LabelFrame(self.root, text="Settings", padding=8)
@@ -128,6 +175,15 @@ class FrontmatterGUI:
             command=self._save_settings,
         ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(4, 0))
 
+        ttk.Checkbutton(settings_frame, text="Add closing video:", variable=self.use_closing,
+                        command=self._save_settings).grid(row=3, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(settings_frame, textvariable=self.closing_path, state="readonly").grid(
+            row=3, column=1, sticky="ew", padx=6, pady=(6, 0))
+        ttk.Button(settings_frame, text="Choose…", command=self._choose_closing).grid(
+            row=3, column=2, pady=(6, 0))
+        ttk.Label(settings_frame, text="Main video: 3-second picture/sound fade in; fade out before closing.").grid(
+            row=4, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
         settings_frame.columnconfigure(1, weight=1)
 
         list_frame = ttk.LabelFrame(self.root, text="Files to process", padding=8)
@@ -147,6 +203,14 @@ class FrontmatterGUI:
         self.process_btn = ttk.Button(btn_row, text="Process", command=self._start_processing)
         self.process_btn.pack(side="right")
 
+        self.stage_var = tk.StringVar(value="Ready to process.")
+        ttk.Label(self.root, textvariable=self.stage_var, wraplength=740).pack(
+            fill="x", padx=12, pady=(8, 0))
+        self.stage_progress = ttk.Progressbar(self.root, mode="determinate", maximum=100)
+        self.stage_progress.pack(fill="x", padx=12, pady=(4, 0))
+        self.batch_var = tk.StringVar(value="Files completed: 0")
+        ttk.Label(self.root, textvariable=self.batch_var).pack(fill="x", padx=12, pady=(6, 0))
+
         self.progress = ttk.Progressbar(self.root, mode="determinate")
         self.progress.pack(fill="x", padx=12, pady=(6, 0))
 
@@ -157,7 +221,7 @@ class FrontmatterGUI:
         # back through the log.
         self.status_var = tk.StringVar(value="Idle.")
         ttk.Label(
-            self.root, textvariable=self.status_var, foreground="#444444", wraplength=600, justify="left",
+            self.root, textvariable=self.status_var, wraplength=680, justify="left",
         ).pack(fill="x", padx=12, pady=(2, 0), anchor="w")
 
         log_frame = ttk.LabelFrame(self.root, text="Log", padding=4)
@@ -204,6 +268,13 @@ class FrontmatterGUI:
             self.frontmatter_path.set(path)
             self._save_settings()
 
+    def _choose_closing(self) -> None:
+        path = filedialog.askopenfilename(title="Choose the closing MP4", filetypes=[("MP4 video", "*.mp4")])
+        if path:
+            self.closing_path.set(path)
+            self.use_closing.set(True)
+            self._save_settings()
+
     def _choose_output_dir(self) -> None:
         path = filedialog.askdirectory(title="Choose output folder")
         if path:
@@ -217,7 +288,8 @@ class FrontmatterGUI:
         # compatible if someone also uses the command line.
         fm = self.frontmatter_path.get()
         target = str(Path(fm).parent) if fm else self.cfg.get("target", "")
-        save_config(target, fm, self.output_dir_path.get() or None, self.auto_trim.get())
+        save_config(target, fm, self.output_dir_path.get() or None, self.auto_trim.get(),
+                    closing=self.closing_path.get(), use_closing=self.use_closing.get())
         self.cfg = load_config()
 
     def _prompt_first_run_setup(self) -> None:
@@ -262,6 +334,17 @@ class FrontmatterGUI:
             messagebox.showerror("Missing frontmatter", "Choose a frontmatter MP4 in Settings first.")
             return
 
+        closing = Path(self.closing_path.get()) if self.use_closing.get() and self.closing_path.get() else None
+        if self.use_closing.get() and (closing is None or not closing.is_file()):
+            messagebox.showerror("Missing closing video", "Choose a closing MP4 or uncheck Add closing video.")
+            return
+        bookends = {Path(frontmatter).resolve()}
+        if closing is not None:
+            bookends.add(closing.resolve())
+        if any(video.resolve() in bookends for video in self.queued_files):
+            messagebox.showerror("Opening or closing in queue", "Remove the opening and closing clips from Files to process.")
+            return
+
         output_dir = Path(self.output_dir_path.get()) if self.output_dir_path.get() else self.queued_files[0].parent / "output"
         output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -272,22 +355,47 @@ class FrontmatterGUI:
             return
 
         files = list(self.queued_files)
+        title_cards = {}
+        for video in files:
+            if already_processed(video, output_dir) is not None:
+                continue
+            dialog = TitleCardDialog(self.root, video)
+            if dialog.result is None:
+                self._log("Cancelled before processing; no videos were changed.")
+                return
+            title_cards[video] = dialog.result
         self.worker_running = True
+        self.failed_files = 0
+        self.worker_error = False
+        self.file_started = time.monotonic()
+        self.batch_var.set(f"Files completed: 0 / {len(files)}")
         self.process_btn.configure(state="disabled")
         self.progress.configure(maximum=len(files), value=0)
         self._log(f"\nStarting: {len(files)} file(s) → {output_dir}")
 
         thread = threading.Thread(
             target=self._worker,
-            args=(ffmpeg_path, Path(frontmatter), files, output_dir, self.auto_trim.get()),
+            args=(ffmpeg_path, Path(frontmatter), files, output_dir, self.auto_trim.get(), title_cards, closing),
             daemon=True,
         )
         thread.start()
 
-    def _worker(
-        self, ffmpeg_path: str, frontmatter: Path, files: list[Path], output_dir: Path, auto_trim: bool,
+    def _worker(self, *args) -> None:
+        try:
+            self._process_files(*args)
+        except Exception as exc:
+            self.result_queue.put(("__ERROR__", str(exc), False))
+        finally:
+            self.result_queue.put(("__DONE__", "", True))
+
+    def _process_files(
+        self, ffmpeg_path: str, frontmatter: Path, files: list[Path], output_dir: Path, auto_trim: bool, title_cards: dict[Path, TitleCard], closing: Path | None,
     ) -> None:
+        def report(stage, fraction):
+            self.result_queue.put(("__PROGRESS__", (stage, fraction), False))
+
         for video in files:
+            self.result_queue.put(("__FILE__", video.name, False))
             self.result_queue.put((video.name, "starting...", False))
             existing = already_processed(video, output_dir)
             if existing is not None:
@@ -296,6 +404,7 @@ class FrontmatterGUI:
 
             with tempfile.TemporaryDirectory() as tmp:
                 if auto_trim:
+                    report("Checking chat log and trimming", None)
                     self.result_queue.put((video.name, "looking for a companion chat log...", False))
                     working_video, trim_msg, offset_seconds = maybe_trim(ffmpeg_path, video, Path(tmp), DEFAULT_TRIGGERS)
                 else:
@@ -305,24 +414,64 @@ class FrontmatterGUI:
                 success, message = process_video(
                     ffmpeg_path, frontmatter, working_video, output_dir,
                     output_name_stem=strip_offset_token(video.stem), offset_seconds=offset_seconds,
+                    title_card=title_cards[video], closing=closing, progress=report,
                 )
             self.result_queue.put((video.name, f"{'done' if success else 'FAILED'}: {message}", True))
-        self.result_queue.put(("__DONE__", "", True))
 
     def _poll_result_queue(self) -> None:
         try:
             while True:
                 name, message, is_terminal = self.result_queue.get_nowait()
-                if name == "__DONE__":
+                if name == "__PROGRESS__":
+                    stage, fraction = message
+                    if stage != self.stage_name or (fraction is not None and
+                            (self.stage_fraction is None or fraction > self.stage_fraction)):
+                        self.last_advance = time.monotonic()
+                    if stage != self.stage_name:
+                        self._log(stage + "…", status=False)
+                    self.stage_name, self.stage_fraction = stage, fraction
+                    self.stage_progress.stop()
+                    if fraction is None:
+                        self.stage_progress.configure(mode="indeterminate")
+                        self.stage_progress.start(15)
+                    else:
+                        self.stage_progress.configure(mode="determinate", value=100 * fraction)
+                elif name == "__FILE__":
+                    self.file_started = self.last_advance = time.monotonic()
+                    self.stage_name, self.stage_fraction = "Starting " + str(message), None
+                    self.stage_progress.configure(mode="indeterminate")
+                    self.stage_progress.start(15)
+                elif name == "__ERROR__":
+                    self.worker_error = True
+                    self._log("FAILED: " + str(message))
+                elif name == "__DONE__":
                     self.worker_running = False
+                    self.stage_progress.stop()
                     self.process_btn.configure(state="normal")
-                    self._log("All done.")
+                    if self.worker_error:
+                        self.stage_var.set("Processing stopped — see the error in the log.")
+                    elif self.failed_files:
+                        self.stage_var.set(f"Finished with {self.failed_files} failed file(s) — see the log.")
+                        self._log("Finished with errors.")
+                    else:
+                        self.stage_progress.configure(mode="determinate", value=100)
+                        self.stage_var.set("All files finished.")
+                        self._log("All done.")
                 else:
                     self._log(f"{name}: {message}")
                     if is_terminal:
+                        self.failed_files += int(str(message).startswith("FAILED"))
                         self.progress.configure(value=self.progress["value"] + 1)
+                        self.batch_var.set(f"Files completed: {int(self.progress['value'])} / {int(self.progress['maximum'])}")
         except queue.Empty:
             pass
+        if self.worker_running:
+            now = time.monotonic()
+            elapsed = int(now - (self.file_started or now))
+            percent = f" — {min(100, int(self.stage_fraction * 100))}%" if self.stage_fraction is not None else " — working"
+            quiet = int(now - (self.last_advance or now))
+            activity = f" — no new progress for {quiet}s" if quiet >= 15 else ""
+            self.stage_var.set(f"{self.stage_name}{percent} — elapsed {elapsed // 60:02d}:{elapsed % 60:02d}{activity}")
         self.root.after(150, self._poll_result_queue)
 
 

@@ -13,6 +13,7 @@ from .core import (
     FfmpegNotFoundError, already_processed, find_target_mp4s, get_ffmpeg_path, process_video,
 )
 from .trim import DEFAULT_TRIGGERS, maybe_trim, strip_offset_token
+from .title_card import TitleCard
 
 # Placeholder defaults, useful to nobody as-is — anyone running this tool
 # should run `add-frontmatter --configure` once instead of relying on
@@ -64,6 +65,13 @@ def build_parser() -> argparse.ArgumentParser:
              f"(default: {default_trigger_desc}). Passing this overrides the default -- only "
              "your phrase will be recognized, not the defaults too.",
     )
+    ap.add_argument("--title", help="Title to use for each video; otherwise prompts per video.")
+    ap.add_argument("--date", help="Date as you want it displayed; otherwise prompts per video.")
+    ap.add_argument("--no-title-animation", action="store_true", help="Show a static title card.")
+    ap.add_argument("--no-title-card", action="store_true", help="Prepend only the opening, without title prompts.")
+    closing_group = ap.add_mutually_exclusive_group()
+    closing_group.add_argument("--closing", help="Optional MP4 to append after the main video's 3-second picture/sound fade-out.")
+    closing_group.add_argument("--no-closing", action="store_true", help="Disable the saved closing clip for this run.")
     return ap
 
 
@@ -104,7 +112,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: frontmatter file not found: {frontmatter}", file=sys.stderr)
         return 1
 
+    closing_value = None if args.no_closing else (args.closing or (cfg.get("closing") if cfg.get("use_closing") else None))
+    closing = Path(closing_value) if closing_value else None
+    if closing is not None and not closing.is_file():
+        print(f"ERROR: closing video not found: {closing}", file=sys.stderr)
+        return 1
     videos = find_target_mp4s(target_dir, frontmatter, output_dir)
+    if closing is not None:
+        videos = [video for video in videos if video.resolve() != closing.resolve()]
     if not videos:
         print("No MP4 files to process (folder empty, or all already have the suffix).")
         return 0
@@ -134,6 +149,18 @@ def main(argv: list[str] | None = None) -> int:
             skipped.append(video.name)
             continue
 
+        card = None
+        if not args.no_title_card:
+            try:
+                title = args.title if args.title is not None else input(f"Title for {video.name}: ")
+                date = args.date if args.date is not None else input("Date to display: ")
+                card = TitleCard(title.strip(), date.strip(), animate=not args.no_title_animation)
+            except (EOFError, KeyboardInterrupt):
+                print("\nCancelled. For unattended use, supply --title and --date, or --no-title-card.", file=sys.stderr)
+                return 1
+            except ValueError as exc:
+                print(f"ERROR: {exc}", file=sys.stderr)
+                return 1
         print(f"\nProcessing: {video.name}")
         with tempfile.TemporaryDirectory() as tmp:
             if args.no_trim:
@@ -145,6 +172,7 @@ def main(argv: list[str] | None = None) -> int:
             success, message = process_video(
                 ffmpeg_path, frontmatter, working_video, output_dir,
                 output_name_stem=strip_offset_token(video.stem), offset_seconds=offset_seconds,
+                title_card=card, closing=closing,
             )
         if success:
             print(f"    done: {message}")

@@ -7,4 +7,4 @@
 # check-version job fails the build if a pushed version tag doesn't match
 # this value and pyproject.toml's (forgotten twice already -- v2.2.2 and
 # v2.2.3 both shipped with the GUI showing the previous version).
-__version__ = "2.2.5"
+__version__ = "2.4.1"

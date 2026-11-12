@@ -3,10 +3,9 @@
 Uses the `imageio-ffmpeg` package, which downloads and caches a portable
 ffmpeg binary automatically on first use — no separate ffmpeg install needed.
 
-Design: the main (submission) video's PICTURE is never re-encoded — it's
-stream-copied byte-for-byte, both when joined to the frontmatter's video and
-in the final output. Only the frontmatter's video is re-encoded, to match the
-main video's resolution, frame rate, and pixel format exactly.
+The opening and optional closing are conformed to the main video's format.
+The main picture is re-encoded when its fade-in or fade-out is required.
+Video-only segments are then joined without another video encode.
 
 Audio is handled separately from video on purpose. Feeding a freshly
 re-encoded frontmatter audio segment into the plain concat demuxer alongside
@@ -16,9 +15,8 @@ duration match the video's duration to the millisecond — the result is a
 small but audible sync drift at the seam (and for the rest of the file). The
 fix is to build one continuous audio track with sample-accurate filtering
 (which works on decoded PCM, not encoded frames) referenced against the
-video's *measured* exact duration, then mux that against the untouched video.
-This does mean the main video's AUDIO is re-encoded (though its picture is
-not) — that's the necessary trade-off for guaranteed sync.
+video's measured duration. Audio fades are applied to the main segment,
+and silence fills any segment without its own audio track.
 """
 
 from __future__ import annotations
@@ -29,6 +27,8 @@ import tempfile
 from pathlib import Path
 
 from .trim import format_offset_token, strip_offset_token
+from .title_card import TitleCard, create_title_video
+from .progress import Progress, run_media
 
 # Tagged onto every output filename as "_{FM_SUFFIX}", and, when a trim was
 # also applied, followed by "_StartOffsetMMSS" (same spelling as the manual
@@ -243,7 +243,8 @@ def _video_encoder_for(codec: str | None) -> str:
     return "libx264"  # safe default for consumer camera footage (h264 or unrecognized)
 
 
-def _decoded_frame_count(ffmpeg_path: str, path: Path, stream: str = "0:v") -> int | None:
+def _decoded_frame_count(ffmpeg_path: str, path: Path, stream: str = "0:v", progress: Progress | None = None,
+                         duration: float | None = None, stage: str = "Checking video duration") -> int | None:
     """Exact frame count via a full decode pass (more reliable than parsing
     container metadata, which can be imprecise or reflect edit lists).
 
@@ -252,15 +253,18 @@ def _decoded_frame_count(ffmpeg_path: str, path: Path, stream: str = "0:v") -> i
     LAST occurrence — the final total — not the first, which would badly
     undercount and was an earlier bug here (e.g. reporting ~100 frames of
     real footage that actually had over 1000)."""
-    result = subprocess.run(
+    result = run_media(
         [ffmpeg_path, "-i", str(path), "-map", stream, "-f", "null", "-", "-hide_banner"],
-        capture_output=True, text=True,
+        duration, progress, stage,
     )
-    matches = re.findall(r"frame=\s*(\d+)", result.stderr)
+    if result.returncode:
+        return None
+    matches = re.findall(r"frame=\s*(\d+)", result.stdout if progress else result.stderr)
     return int(matches[-1]) if matches else None
 
 
-def conform_frontmatter_video(ffmpeg_path: str, frontmatter: Path, target: dict, tmp_dir: Path) -> tuple[Path | None, float, str]:
+def conform_frontmatter_video(ffmpeg_path: str, frontmatter: Path, target: dict, tmp_dir: Path, extra_filters: str = "", progress: Progress | None = None,
+                              stage: str = "Preparing opening") -> tuple[Path | None, float, str]:
     """Re-encode just the frontmatter's video to match the main video's
     resolution, frame rate, and pixel format. No audio here — audio is built
     separately for sample-accurate sync (see module docstring).
@@ -273,15 +277,18 @@ def conform_frontmatter_video(ffmpeg_path: str, frontmatter: Path, target: dict,
 
     vf = (
         f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps},format={pix_fmt}"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps}:eof_action=pass,format={pix_fmt}"
     )
 
+    if extra_filters:
+        vf += "," + extra_filters
     out = tmp_dir / "frontmatter_video_only.mp4"
+    # Allow reordered frames in the prefix so the main video's initial
+    # B-frame decode timestamps do not overlap the preceding segment.
     cmd = [
         ffmpeg_path, "-y", "-hide_banner", "-loglevel", "error", "-fflags", "+genpts",
         "-i", str(frontmatter),
-        "-vf", vf, "-fps_mode", "cfr", "-c:v", vcodec, "-crf", "18", "-preset", "medium", "-bf", "0",
-        "-avoid_negative_ts", "make_zero",
+        "-vf", vf, "-fps_mode", "cfr", "-c:v", vcodec, "-crf", "18", "-preset", "medium", "-bf", "2",
     ]
     # Match the main video's own timebase exactly. The concat demuxer used
     # later doesn't reliably rescale timestamps between files with different
@@ -293,18 +300,20 @@ def conform_frontmatter_video(ffmpeg_path: str, frontmatter: Path, target: dict,
     if target["tbn"]:
         cmd += ["-video_track_timescale", str(target["tbn"])]
     cmd += ["-an", str(out)]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    source_duration = probe_streams(ffmpeg_path, frontmatter)["duration"]
+    result = run_media(cmd, source_duration, progress, stage)
     if result.returncode != 0 or not out.exists():
         return None, 0.0, result.stderr.strip()[-800:] or "ffmpeg failed to encode frontmatter video"
 
-    frame_count = _decoded_frame_count(ffmpeg_path, out)
+    frame_count = _decoded_frame_count(ffmpeg_path, out, progress=progress, duration=source_duration,
+                                       stage=stage.replace("Preparing", "Verifying").replace("Building", "Verifying"))
     if not frame_count:
         return None, 0.0, "could not determine conformed frontmatter's frame count"
     precise_duration = frame_count / fps  # exact, by construction of CFR encoding above
     return out, precise_duration, "ok"
 
 
-def _extract_video_only(ffmpeg_path: str, video: Path, out_path: Path) -> tuple[bool, str]:
+def _extract_video_only(ffmpeg_path: str, video: Path, out_path: Path, progress: Progress | None = None) -> tuple[bool, str]:
     """Stream-copy just the video track out of a file — byte-identical
     picture, just dropping any audio stream so it matches the frontmatter's
     video-only layout for the concat demuxer (see concat_video_only)."""
@@ -312,94 +321,16 @@ def _extract_video_only(ffmpeg_path: str, video: Path, out_path: Path) -> tuple[
         ffmpeg_path, "-y", "-hide_banner", "-loglevel", "error",
         "-i", str(video), "-map", "0:v:0", "-c:v", "copy", "-an", str(out_path),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = run_media(cmd, probe_streams(ffmpeg_path, video)["duration"], progress, "Preparing main video")
     ok = result.returncode == 0 and out_path.exists()
     return ok, result.stderr.strip()[-800:] if not ok else "ok"
 
 
-def concat_video_only(ffmpeg_path: str, frontmatter_video: Path, video: Path, out_path: Path, list_file: Path, tmp_dir: Path) -> tuple[bool, str]:
-    """Stream-copy concat of just the two video tracks — no audio involved,
-    so this is straightforward and frame-accurate. Main video's picture
-    passes through untouched.
-
-    The concat *demuxer* requires every listed file to have the same stream
-    layout. frontmatter_video is video-only (1 stream); if the main video
-    file still has its own audio stream (2 streams) when handed to the
-    demuxer directly, that layout mismatch corrupts the splice — packets get
-    misattributed and the second file's timestamps come out wildly wrong
-    (seen as the main video's picture jumping to the wrong point in time,
-    tens of seconds off, not just a few milliseconds). So the main video is
-    first stream-copied into its own video-only file — same picture, byte
-    for byte, just matching layout — before the two are concatenated."""
-    main_video_only = tmp_dir / "main_video_only.mp4"
-    ok, msg = _extract_video_only(ffmpeg_path, video, main_video_only)
-    if not ok:
-        return False, f"failed to extract main video's picture: {msg}"
-
-    list_file.write_text(
-        f"file '{frontmatter_video.as_posix()}'\nfile '{main_video_only.as_posix()}'\n",
-        encoding="utf-8",
-    )
-    cmd = [
-        ffmpeg_path, "-y", "-hide_banner", "-loglevel", "error",
-        "-f", "concat", "-safe", "0", "-i", str(list_file),
-        "-map", "0:v:0", "-c:v", "copy", "-an", str(out_path),
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    ok = result.returncode == 0 and out_path.exists()
-    return ok, result.stderr.strip()[-800:] if not ok else "ok"
-
-
-def build_audio_track(
-    ffmpeg_path: str, frontmatter: Path, fm_precise_duration: float, video: Path, target: dict, tmp_dir: Path
-) -> tuple[Path | None, str]:
-    """Build one continuous, sample-accurate audio track: frontmatter's audio
-    (or generated silence, trimmed exactly to the conformed frontmatter
-    video's measured duration) followed by the main video's own original
-    audio in full. Uses the concat *filter* (decoded samples), not the
-    demuxer, so there's no AAC frame-boundary quantization at the seam."""
-    fm_info = probe_streams(ffmpeg_path, frontmatter)
-    sample_rate = target["sample_rate"] or 48000
-    channels = target["channels"] or 2
-    out = tmp_dir / "audio_track.m4a"
-
-    if fm_info["has_audio"]:
-        inputs = ["-i", str(frontmatter), "-i", str(video)]
-        fm_chain = (
-            f"[0:a]atrim=0:{fm_precise_duration:.6f},asetpts=PTS-STARTPTS,"
-            f"aresample=async=1:first_pts=0,aformat=sample_rates={sample_rate}[a0]"
-        )
-        main_idx = 1
-    else:
-        layout = "stereo" if channels == 2 else "mono" if channels == 1 else f"{channels}c"
-        inputs = ["-i", str(video), "-f", "lavfi", "-i", f"anullsrc=r={sample_rate}:cl={layout}"]
-        fm_chain = (
-            f"[1:a]atrim=0:{fm_precise_duration:.6f},asetpts=PTS-STARTPTS,"
-            f"aformat=sample_rates={sample_rate}[a0]"
-        )
-        main_idx = 0
-
-    main_chain = f"[{main_idx}:a]aformat=sample_rates={sample_rate},asetpts=PTS-STARTPTS[a1]"
-    concat_chain = "[a0][a1]concat=n=2:v=0:a=1[outa]"
-    filter_complex = ";".join([fm_chain, main_chain, concat_chain])
-
-    cmd = [
-        ffmpeg_path, "-y", "-hide_banner", "-loglevel", "error",
-        *inputs,
-        "-filter_complex", filter_complex,
-        "-map", "[outa]", "-c:a", "aac", "-ar", str(sample_rate), "-ac", str(channels),
-        str(out),
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode == 0 and out.exists():
-        return out, "ok"
-    return None, result.stderr.strip()[-800:] or "ffmpeg failed to build the combined audio track"
-
-
-def mux_video_and_audio(ffmpeg_path: str, video_path: Path, audio_path: Path | None, out_path: Path) -> tuple[bool, str]:
-    """Combine the (untouched, stream-copied) combined video with the
+def mux_video_and_audio(ffmpeg_path: str, video_path: Path, audio_path: Path | None, out_path: Path, progress: Progress | None = None,
+                        duration: float | None = None) -> tuple[bool, str]:
+    """Combine the joined picture track with the
     (freshly built) combined audio into the final output. If audio_path is
-    None, the output is video-only (matches the main video having no audio)."""
+    None, all sequence segments are silent and the output is video-only."""
     if audio_path is None:
         cmd = [
             ffmpeg_path, "-y", "-hide_banner", "-loglevel", "error",
@@ -412,7 +343,7 @@ def mux_video_and_audio(ffmpeg_path: str, video_path: Path, audio_path: Path | N
             "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "copy",
             str(out_path),
         ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = run_media(cmd, duration, progress, "Saving final video")
     ok = result.returncode == 0 and out_path.exists()
     return ok, result.stderr.strip()[-800:] if not ok else "ok"
 
@@ -420,12 +351,14 @@ def mux_video_and_audio(ffmpeg_path: str, video_path: Path, audio_path: Path | N
 def process_video(
     ffmpeg_path: str, frontmatter: Path, video: Path, output_dir: Path,
     output_name_stem: str | None = None, offset_seconds: float | None = None,
+    title_card: TitleCard | None = None, closing: Path | None = None,
+    progress: Progress | None = None,
 ) -> tuple[bool, str]:
-    """Process a single video. The main video's picture is stream-copied
-    (byte-identical, never re-encoded) both at the video-concat step and in
-    the final mux. Audio is rebuilt from scratch with sample-accurate
-    filtering to guarantee sync at the seam — see module docstring for why
-    that's necessary. Returns (success, message).
+    """Join opening, title, main and optional closing with synchronized fades.
+
+    The main picture is encoded when fades are requested. Segments are joined
+    with stream copy, and audio is aligned to their measured video durations.
+    Returns (success, message).
 
     output_name_stem lets a caller pass a trimmed temp file as `video` (see
     trim.maybe_trim) while still naming the result after the ORIGINAL
@@ -443,32 +376,76 @@ def process_video(
     out_path = output_path_for(stem, video.suffix, output_dir, offset_seconds)
     out_name = out_path.name
 
+    if progress:
+        progress("Reading video information", None)
     target = probe_streams(ffmpeg_path, video)
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp_dir = Path(tmp)
 
-        fm_video, fm_duration, msg = conform_frontmatter_video(ffmpeg_path, frontmatter, target, tmp_dir)
+        fm_video, fm_duration, msg = conform_frontmatter_video(ffmpeg_path, frontmatter, target, tmp_dir, progress=progress)
         if fm_video is None:
             return False, f"failed to conform frontmatter video: {msg}"
 
+        title_video, title_duration = None, 0.0
+        if title_card is not None:
+            title_video, title_duration, msg = create_title_video(
+                ffmpeg_path, title_card, target, tmp_dir, _video_encoder_for(target["video_codec"]), progress=progress
+            )
+            if title_video is None:
+                return False, f"failed to create title card: {msg}"
+
+        # Every segment has a video-only track with the main video's format.
+        # Fades require encoding the main picture as well as the bookends.
+        from .sequence import build_sequence_audio, join_picture_tracks, main_fade_times
+        main_duration = target["duration"]
+        if not main_duration or main_duration <= 0:
+            return False, "could not determine main video duration"
+        fade_in, fade_out = main_fade_times(main_duration, title_card is not None, closing is not None)
+        main_filters = []
+        if fade_in:
+            main_filters.append(f"fade=t=in:st=0:d={fade_in:.9f}")
+        if fade_out:
+            main_filters.append(f"fade=t=out:st={main_duration-fade_out:.9f}:d={fade_out:.9f}")
+        pictures = [fm_video]
+        audio_segments = [(frontmatter, fm_duration, 0.0, 0.0)]
+        if title_video is not None:
+            pictures.append(title_video)
+            audio_segments.append((None, title_duration, 0.0, 0.0))
+        if main_filters:
+            main_tmp = tmp_dir / "main"
+            main_tmp.mkdir()
+            main_picture, precise_main_duration, msg = conform_frontmatter_video(
+                ffmpeg_path, video, target, main_tmp, ",".join(main_filters), progress=progress, stage="Building main video")
+            if main_picture is None:
+                return False, f"failed to fade main video: {msg}"
+        else:
+            main_picture = tmp_dir / "main_video_only.mp4"
+            ok, msg = _extract_video_only(ffmpeg_path, video, main_picture, progress=progress)
+            if not ok:
+                return False, f"failed to extract main video: {msg}"
+            precise_main_duration = main_duration
+        pictures.append(main_picture)
+        audio_segments.append((video, precise_main_duration, fade_in, fade_out))
+        if closing is not None:
+            closing_tmp = tmp_dir / "closing"
+            closing_tmp.mkdir()
+            closing_picture, closing_duration, msg = conform_frontmatter_video(
+                ffmpeg_path, closing, target, closing_tmp, progress=progress, stage="Preparing closing")
+            if closing_picture is None:
+                return False, f"failed to conform closing video: {msg}"
+            pictures.append(closing_picture)
+            audio_segments.append((closing, closing_duration, 0.0, 0.0))
         combined_video = tmp_dir / "combined_video.mp4"
-        list_file = tmp_dir / "concat_list.txt"
-        ok, msg = concat_video_only(ffmpeg_path, fm_video, video, combined_video, list_file, tmp_dir)
+        ok, msg = join_picture_tracks(ffmpeg_path, pictures, combined_video, tmp_dir / "concat_list.txt",
+                                      duration=sum(segment[1] for segment in audio_segments), progress=progress)
         if not ok:
             return False, f"video concat failed: {msg}"
-
-        if not target["has_audio"]:
-            ok, msg = mux_video_and_audio(ffmpeg_path, combined_video, None, out_path)
-            if ok:
-                return True, f"{out_name} (main video's picture untouched; no audio in source)"
-            return False, f"final mux failed: {msg}"
-
-        audio_track, msg = build_audio_track(ffmpeg_path, frontmatter, fm_duration, video, target, tmp_dir)
-        if audio_track is None:
+        audio_track, msg = build_sequence_audio(ffmpeg_path, audio_segments, target, tmp_dir, progress=progress)
+        if msg != "ok":
             return False, f"failed to build audio track: {msg}"
-
-        ok, msg = mux_video_and_audio(ffmpeg_path, combined_video, audio_track, out_path)
+        ok, msg = mux_video_and_audio(ffmpeg_path, combined_video, audio_track, out_path, progress=progress,
+                                      duration=sum(segment[1] for segment in audio_segments))
         if ok:
-            return True, f"{out_name} (main video's picture untouched; audio rebuilt for sync)"
+            return True, f"{out_name} (video and audio transitions applied)"
         return False, f"final mux failed: {msg}"

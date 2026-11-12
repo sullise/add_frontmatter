@@ -29,6 +29,7 @@ def load_config() -> dict:
 
 def save_config(
     target: str, frontmatter: str, output_dir: str | None, auto_trim: bool = True,
+    closing: str | None = None, use_closing: bool | None = None,
 ) -> Path:
     """Save the given values as this user's defaults. Returns the config path.
 
@@ -43,6 +44,9 @@ def save_config(
         "target": target, "frontmatter": frontmatter, "output_dir": output_dir,
         "auto_trim": auto_trim,
     }
+    previous = load_config()
+    data["closing"] = closing if closing is not None else previous.get("closing", "")
+    data["use_closing"] = use_closing if use_closing is not None else previous.get("use_closing", False)
     CONFIG_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
     return CONFIG_FILE
 
